@@ -1,0 +1,14 @@
+{
+  "name": "discord-wallet-bot",
+  "version": "1.0.0",
+  "description": "Self-custodial-style EVM wallet Discord bot (discord.js, ethers v6, SQLite)",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=18.17" },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.4"
+  }
+}
