@@ -4,7 +4,7 @@ require('dotenv').config();
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { promisify } = require('node:util');
-const Database = require('better-sqlite3');
+const { DatabaseSync } = require('node:sqlite'); // built into Node >=22.13, no native build step
 const { ethers } = require('ethers');
 const {
   Client, GatewayIntentBits, REST, Routes, Events, MessageFlags,
@@ -71,11 +71,11 @@ async function encryptKey(userId, address, privateKey, pin) {
 
 async function decryptKey(row, pin) {
   try {
-    const key = await deriveKey(pin, row.salt);
-    const d = crypto.createDecipheriv('aes-256-gcm', key, row.iv);
+    const key = await deriveKey(pin, Buffer.from(row.salt));
+    const d = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(row.iv));
     d.setAAD(aad(row.discord_id, row.address));
-    d.setAuthTag(row.tag);
-    const pt = Buffer.concat([d.update(row.ct), d.final()]);
+    d.setAuthTag(Buffer.from(row.tag));
+    const pt = Buffer.concat([d.update(Buffer.from(row.ct)), d.final()]);
     const hex = '0x' + pt.toString('hex');
     pt.fill(0); key.fill(0);
     return hex;
@@ -87,9 +87,9 @@ async function decryptKey(row, pin) {
 /* ------------------------------------------------------------------ */
 /* Database                                                            */
 /* ------------------------------------------------------------------ */
-const db = new Database(DB_PATH);
+const db = new DatabaseSync(DB_PATH);
 try { fs.chmodSync(DB_PATH, 0o600); } catch { /* non-fatal */ }
-db.pragma('journal_mode = WAL');
+db.exec('PRAGMA journal_mode = WAL;');
 db.exec(`
   CREATE TABLE IF NOT EXISTS wallets (
     discord_id      TEXT PRIMARY KEY,
@@ -194,6 +194,8 @@ const gwei = (v) => Number(ethers.formatUnits(v, 'gwei')).toFixed(2);
 const short = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 const txLink = (h) => (EXPLORER_TX ? `[${h.slice(0, 10)}…${h.slice(-6)}](${EXPLORER_TX}${h})` : `\`${h}\``);
 const addrLink = (a) => (EXPLORER_TX.endsWith('/tx/') ? ` • [Explorer](${EXPLORER_TX.replace(/\/tx\/$/, '/address/')}${a})` : '');
+// ethers often wraps the node's real error; dig it out so users see e.g. "nonce too low"
+const rpcReason = (e) => e?.info?.error?.message || e?.error?.message || e?.shortMessage || e?.message || 'RPC error';
 const botAvatar = () => client.user?.displayAvatarURL({ extension: 'png', size: 256 });
 
 /* ------------------------------------------------------------------ */
@@ -474,9 +476,9 @@ async function handleSendSubmit(i, quoteId) {
     try {
       tx = await wallet.sendTransaction(req);
     } catch (e) {
-      console.error('send failed:', e.shortMessage || e.message);
+      console.error('send failed:', rpcReason(e));
       pending.set(quoteId, q); // PIN was correct; let them retry the same quote
-      return i.editReply(fail(`Broadcast failed: ${e.shortMessage || 'RPC error'}. Nothing was sent. You can press **Confirm** again.`));
+      return i.editReply(fail(`Broadcast failed: ${rpcReason(e).slice(0, 200)}\nNothing was sent. You can press **Confirm** again.`));
     }
 
     const line = `**${ethers.formatEther(q.value)} ${SYMBOL}** ➜ \`${short(q.to)}\``;
@@ -555,7 +557,7 @@ async function handleModal(i) {
     try {
       await storeWallet(uid, w.privateKey, w.address, pin);
     } catch (e) {
-      if (String(e.code).startsWith('SQLITE_CONSTRAINT')) return i.editReply(fail('That wallet is already registered with this bot.'));
+      if (/constraint/i.test(String(e.message))) return i.editReply(fail('That wallet is already registered with this bot.'));
       throw e;
     }
     const p = await depositPayload(w.address, creating ? '🎉 Wallet created' : '🎉 Wallet imported');

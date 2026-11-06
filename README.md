@@ -3,7 +3,7 @@
 Setup
 1. Discord dev portal: copy Application ID + bot token. Invite with scopes `bot` and `applications.commands` (no permissions or privileged intents needed).
 2. `cp .env.example .env`, fill it in (testnet first).
-3. `npm install && npm start`
+3. `npm install && npm start  (needs Node 22.13+; SQLite is built in, no native build)`
 
 Use `/wallet panel` for the dashboard (Deposit QR, Send, Refresh, Export, Change PIN, Delete). `/send to amount` also works (amount may be `max`).
 
