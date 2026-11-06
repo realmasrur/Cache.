@@ -4,13 +4,14 @@ require('dotenv').config();
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { promisify } = require('node:util');
-const { DatabaseSync } = require('node:sqlite'); // built into Node >=22.13, no native build step
 const { ethers } = require('ethers');
 const {
   Client, GatewayIntentBits, REST, Routes, Events, MessageFlags,
   SlashCommandBuilder, ModalBuilder, TextInputBuilder, TextInputStyle,
   ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, AttachmentBuilder,
+  StringSelectMenuBuilder, Options,
 } = require('discord.js');
+const { openDb } = require('./db');
 const { renderQr } = require('./qr');
 
 /* ------------------------------------------------------------------ */
@@ -23,7 +24,7 @@ const need = (k) => {
 };
 const TOKEN = need('DISCORD_TOKEN');
 const CLIENT_ID = need('DISCORD_CLIENT_ID');
-const RPC_URLS = need('RPC_URL').split(',').map((s) => s.trim()).filter(Boolean); // comma-separated = fallback list
+const RPC_URLS = need('RPC_URL').split(',').map((s) => s.trim()).filter(Boolean);
 const MASTER_SECRET = need('MASTER_SECRET');
 if (MASTER_SECRET.length < 32) {
   console.error('MASTER_SECRET must be at least 32 characters (try: openssl rand -hex 32)');
@@ -32,46 +33,65 @@ if (MASTER_SECRET.length < 32) {
 const GUILD_ID = env.GUILD_ID || null;
 const DB_PATH = env.DB_PATH || './wallets.db';
 const SYMBOL = env.NATIVE_SYMBOL || 'ETH';
-const EXPLORER_TX = env.EXPLORER_TX_URL || '';           // e.g. https://sepolia.etherscan.io/tx/
-const LOGO_PATH = env.LOGO_PATH || '';                   // optional PNG for the QR centre; default = bot avatar
+const EXPLORER_TX = env.EXPLORER_TX_URL || '';
+const LOGO_PATH = env.LOGO_PATH || '';                    // optional PNG for the QR centre; default = bot avatar
 const CONFIRMATIONS = Number(env.CONFIRMATIONS ?? 2);
 const POLL_MS = Number(env.POLL_MS || 12000);
+const MAX_WALLETS = Math.min(Math.max(Number(env.MAX_WALLETS || 5), 1), 10);
 
 const MAX_ATTEMPTS = 5;
 const BASE_LOCK_MS = 15 * 60 * 1000;
 const MAX_LOCK_MS = 24 * 60 * 60 * 1000;
 const SEND_TTL_MS = 2 * 60 * 1000;
-const MAX_BLOCKS_PER_TICK = 20;
+const MAX_BLOCKS_PER_TICK = 5;
+const MAX_CATCHUP_BLOCKS = Number(env.MAX_CATCHUP_BLOCKS || 600); // after downtime, skip older blocks instead of replaying them
+// scrypt memory = 128 * 2^N * 8 bytes: 15 -> 32 MB (default), 14 -> 16 MB, 13 -> 8 MB. Lower it on small hosts.
+const SCRYPT_LOG_N = Math.min(Math.max(Number(env.SCRYPT_LOG_N || 15), 12), 17);
 const PIN_RE = /^\d{6,12}$/;
+
+const mem = () => {
+  const m = process.memoryUsage();
+  const mb = (x) => Math.round(x / 1048576);
+  return `rss ${mb(m.rss)} MB (heap ${mb(m.heapUsed)}, native ${mb(m.external + m.arrayBuffers)})`;
+};
 
 /* ------------------------------------------------------------------ */
 /* Crypto: AES-256-GCM, key = HMAC(masterKey, scrypt(PIN, salt))       */
 /* ------------------------------------------------------------------ */
 const scrypt = promisify(crypto.scrypt);
-const SCRYPT = { N: 2 ** 15, r: 8, p: 1, maxmem: 128 * 1024 * 1024 };
-const masterKey = crypto.scryptSync(MASTER_SECRET, 'discord-wallet-bot/master/v1', 32, SCRYPT);
+const scryptOpts = (logN) => ({ N: 2 ** logN, r: 8, p: 1, maxmem: 256 * 1024 * 1024 });
+// Fixed forever: changing it would make every existing wallet undecryptable.
+let masterKeyP;
+const getMasterKey = () => (masterKeyP ||= scrypt(MASTER_SECRET, 'discord-wallet-bot/master/v1', 32, scryptOpts(15)));
 
-async function deriveKey(pin, salt) {
-  const pinKey = await scrypt(pin, salt, 32, SCRYPT);
-  return crypto.createHmac('sha256', masterKey).update(pinKey).digest();
+// scrypt is memory-hungry: run them one at a time so concurrent users can't spike RAM.
+let scryptQueue = Promise.resolve();
+function deriveKey(pin, salt, logN) {
+  const run = scryptQueue.then(async () => {
+    const master = await getMasterKey();
+    const pinKey = await scrypt(pin, salt, 32, scryptOpts(logN));
+    return crypto.createHmac('sha256', master).update(pinKey).digest();
+  });
+  scryptQueue = run.catch(() => {});
+  return run;
 }
 const aad = (userId, address) => Buffer.from(`${userId}:${address.toLowerCase()}`);
 
 async function encryptKey(userId, address, privateKey, pin) {
   const salt = crypto.randomBytes(16);
   const iv = crypto.randomBytes(12);
-  const key = await deriveKey(pin, salt);
+  const key = await deriveKey(pin, salt, SCRYPT_LOG_N);
   const c = crypto.createCipheriv('aes-256-gcm', key, iv);
   c.setAAD(aad(userId, address));
   const pt = Buffer.from(privateKey.slice(2), 'hex');
   const ct = Buffer.concat([c.update(pt), c.final()]);
   pt.fill(0); key.fill(0);
-  return { salt, iv, tag: c.getAuthTag(), ct };
+  return { salt, iv, tag: c.getAuthTag(), ct, kdf_n: SCRYPT_LOG_N };
 }
 
 async function decryptKey(row, pin) {
   try {
-    const key = await deriveKey(pin, Buffer.from(row.salt));
+    const key = await deriveKey(pin, Buffer.from(row.salt), row.kdf_n || 15);
     const d = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(row.iv));
     d.setAAD(aad(row.discord_id, row.address));
     d.setAuthTag(Buffer.from(row.tag));
@@ -85,62 +105,38 @@ async function decryptKey(row, pin) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Database                                                            */
+/* Database + account helpers                                          */
 /* ------------------------------------------------------------------ */
-const db = new DatabaseSync(DB_PATH);
-try { fs.chmodSync(DB_PATH, 0o600); } catch { /* non-fatal */ }
-db.exec('PRAGMA journal_mode = WAL;');
-db.exec(`
-  CREATE TABLE IF NOT EXISTS wallets (
-    discord_id      TEXT PRIMARY KEY,
-    address         TEXT NOT NULL UNIQUE,
-    salt            BLOB NOT NULL,
-    iv              BLOB NOT NULL,
-    tag             BLOB NOT NULL,
-    ct              BLOB NOT NULL,
-    failed_attempts INTEGER NOT NULL DEFAULT 0,
-    lock_count      INTEGER NOT NULL DEFAULT 0,
-    locked_until    INTEGER NOT NULL DEFAULT 0,
-    since_block     INTEGER NOT NULL DEFAULT 0,
-    created_at      INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS deposits (
-    tx_hash    TEXT NOT NULL,
-    discord_id TEXT NOT NULL,
-    amount     TEXT NOT NULL,
-    block      INTEGER NOT NULL,
-    PRIMARY KEY (tx_hash, discord_id)
-  );
-`);
-const st = {
-  get: db.prepare('SELECT * FROM wallets WHERE discord_id = ?'),
-  all: db.prepare('SELECT discord_id, address, since_block FROM wallets'),
-  insert: db.prepare(`INSERT INTO wallets (discord_id, address, salt, iv, tag, ct, since_block, created_at)
-                      VALUES (@discord_id, @address, @salt, @iv, @tag, @ct, @since_block, @created_at)`),
-  reencrypt: db.prepare('UPDATE wallets SET salt=@salt, iv=@iv, tag=@tag, ct=@ct WHERE discord_id=@discord_id'),
-  del: db.prepare('DELETE FROM wallets WHERE discord_id = ?'),
-  attempt: db.prepare('UPDATE wallets SET failed_attempts=?, lock_count=?, locked_until=? WHERE discord_id=?'),
-  reset: db.prepare('UPDATE wallets SET failed_attempts=0, lock_count=0, locked_until=0 WHERE discord_id=?'),
-  getMeta: db.prepare('SELECT value FROM meta WHERE key = ?'),
-  setMeta: db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value'),
-  deposit: db.prepare('INSERT OR IGNORE INTO deposits (tx_hash, discord_id, amount, block) VALUES (?, ?, ?, ?)'),
-};
-const watch = new Map(); // lowercase address -> { id, since }
-for (const r of st.all.all()) watch.set(r.address.toLowerCase(), { id: r.discord_id, since: r.since_block });
+const { db, st } = openDb(DB_PATH);
+const watch = new Map(); // lowercase address -> { acct, since }
+for (const r of st.watchAll.all()) watch.set(r.address.toLowerCase(), { acct: r.id, since: r.since_block });
+
+function activeAccount(uid) {
+  const u = st.user.get(uid);
+  if (!u) return null;
+  let a = u.active_id ? st.account.get(u.active_id, uid) : null;
+  if (!a) {
+    a = st.accounts.all(uid)[0] || null;
+    if (a) st.setActive.run(a.id, uid);
+  }
+  return a;
+}
+
+const cleanLabel = (s, fallback) => (String(s || '').replace(/\s+/g, ' ').trim().slice(0, 24) || fallback);
 
 /* ------------------------------------------------------------------ */
-/* PIN verification with persistent lockout                            */
+/* PIN verification with persistent per-user lockout                   */
 /* ------------------------------------------------------------------ */
-async function unlock(userId, pin) {
-  const row = st.get.get(userId);
-  if (!row) return { status: 'none' };
+async function unlock(userId, pin, accountId) {
+  const u = st.user.get(userId);
+  const row = accountId ? st.account.get(accountId, userId) : null;
+  if (!u || !row) return { status: 'none' };
   const now = Date.now();
-  if (row.locked_until > now) return { status: 'locked', until: row.locked_until };
+  if (u.locked_until > now) return { status: 'locked', until: u.locked_until };
 
   // Count the attempt synchronously BEFORE the slow check so parallel guesses can't bypass the limit.
-  const attempts = row.failed_attempts + 1;
-  let lockCount = row.lock_count;
+  const attempts = u.failed_attempts + 1;
+  let lockCount = u.lock_count;
   let lockedUntil = 0;
   const lockNow = attempts >= MAX_ATTEMPTS;
   if (lockNow) {
@@ -175,9 +171,9 @@ const warn = (title, desc) => ({ embeds: [base(C.warn).setTitle(`⚠️ ${title}
 const fail = (desc) => ({ embeds: [base(C.err).setTitle('❌ Something to fix').setDescription(desc)], components: [] });
 
 function unlockFail(r) {
-  if (r.status === 'none') return fail("You don't have a wallet yet. Use `/wallet panel` to set one up.");
+  if (r.status === 'none') return fail("That wallet wasn't found. Use `/wallet panel` to set one up.");
   if (r.status === 'locked') {
-    return { embeds: [base(C.err).setTitle('🔒 Wallet locked')
+    return { embeds: [base(C.err).setTitle('🔒 Wallets locked')
       .setDescription(`Too many wrong PINs. Try again <t:${Math.ceil(r.until / 1000)}:R>.`)], components: [] };
   }
   return fail(`Wrong PIN. **${r.left}** attempt${r.left === 1 ? '' : 's'} left before a lockout.`);
@@ -193,7 +189,7 @@ const fmt = (v, dp = 8) => {
 const gwei = (v) => Number(ethers.formatUnits(v, 'gwei')).toFixed(2);
 const short = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 const txLink = (h) => (EXPLORER_TX ? `[${h.slice(0, 10)}…${h.slice(-6)}](${EXPLORER_TX}${h})` : `\`${h}\``);
-const addrLink = (a) => (EXPLORER_TX.endsWith('/tx/') ? ` • [Explorer](${EXPLORER_TX.replace(/\/tx\/$/, '/address/')}${a})` : '');
+const addrLink = (a) => (EXPLORER_TX.endsWith('/tx/') ? `[Explorer](${EXPLORER_TX.replace(/\/tx\/$/, '/address/')}${a})` : '');
 // ethers often wraps the node's real error; dig it out so users see e.g. "nonce too low"
 const rpcReason = (e) => e?.info?.error?.message || e?.error?.message || e?.shortMessage || e?.message || 'RPC error';
 const botAvatar = () => client.user?.displayAvatarURL({ extension: 'png', size: 256 });
@@ -201,7 +197,7 @@ const botAvatar = () => client.user?.displayAvatarURL({ extension: 'png', size: 
 /* ------------------------------------------------------------------ */
 /* QR code with logo                                                   */
 /* ------------------------------------------------------------------ */
-let logoBuf; // undefined = not loaded yet, null = none available
+let logoBuf; // undefined = not loaded yet, null = none
 const qrCache = new Map();
 
 async function loadLogo() {
@@ -210,7 +206,7 @@ async function loadLogo() {
   try {
     if (LOGO_PATH) logoBuf = fs.readFileSync(LOGO_PATH);
     else {
-      const url = client.user.displayAvatarURL({ extension: 'png', size: 256, forceStatic: true });
+      const url = client.user.displayAvatarURL({ extension: 'png', size: 128, forceStatic: true });
       const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
       if (res.ok) logoBuf = Buffer.from(await res.arrayBuffer());
     }
@@ -223,7 +219,7 @@ async function qrAttachment(address) {
     let png = qrCache.get(address);
     if (!png) {
       png = await renderQr(address, await loadLogo());
-      if (qrCache.size > 200) qrCache.delete(qrCache.keys().next().value);
+      if (qrCache.size > 50) qrCache.delete(qrCache.keys().next().value);
       qrCache.set(address, png);
     }
     return new AttachmentBuilder(png, { name: 'deposit.png' });
@@ -233,10 +229,11 @@ async function qrAttachment(address) {
   }
 }
 
-async function depositPayload(address, headline = '📥 Deposit') {
-  const file = await qrAttachment(address);
-  const e = base(C.brand).setTitle(headline)
-    .setDescription(`Send **${SYMBOL}** on **${NETWORK_LABEL}** to your address:\n\`\`\`${address}\`\`\`${addrLink(address).replace(' • ', '')}`)
+async function depositPayload(row, headline) {
+  const file = await qrAttachment(row.address);
+  const link = addrLink(row.address);
+  const e = base(C.brand).setTitle(headline || `📥 Deposit • ${row.label}`)
+    .setDescription(`Send **${SYMBOL}** on **${NETWORK_LABEL}** to this address:\n\`\`\`${row.address}\`\`\`\n${link}`)
     .addFields({ name: 'Heads up', value: `Only ${SYMBOL} is supported. Tokens sent here can't be viewed or sent by this bot. You'll get a DM when a deposit lands.` });
   if (file) e.setImage('attachment://deposit.png');
   return { embeds: [e], components: [], files: file ? [file] : [] };
@@ -277,8 +274,7 @@ async function connect() {
     if (healthy.length) {
       const network = ethers.Network.from(chainId);
       if (!env.NETWORK_NAME) NETWORK_LABEL = network.name && network.name !== 'unknown' ? network.name : `Chain ${chainId}`;
-      // batchMaxCount: 1 avoids "batch request not allowed" errors on many free RPC tiers
-      const opts = { staticNetwork: network, batchMaxCount: 1 };
+      const opts = { staticNetwork: network, batchMaxCount: 1 }; // many free RPCs reject batched requests
       const list = healthy.map((u) => new ethers.JsonRpcProvider(u, network, opts));
       console.log(`Connected: chain ${chainId} via ${healthy.length} RPC(s)`);
       return list.length === 1 ? list[0] : new ethers.FallbackProvider(list, network, { quorum: 1 });
@@ -288,12 +284,16 @@ async function connect() {
   }
 }
 
-async function storeWallet(userId, privateKey, address, pin) {
+async function storeWallet(userId, label, privateKey, address, pin) {
   const enc = await encryptKey(userId, address, privateKey, pin);
   let since = lastScanned;
   try { since = await provider.getBlockNumber(); } catch { /* keep lastScanned */ }
-  st.insert.run({ discord_id: userId, address, ...enc, since_block: since, created_at: Date.now() });
-  watch.set(address.toLowerCase(), { id: userId, since });
+  st.ensureUser.run(userId);
+  const res = st.insert.run({ discord_id: userId, label, address, ...enc, since_block: since, created_at: Date.now() });
+  const id = Number(res.lastInsertRowid);
+  st.setActive.run(id, userId); // newly created/imported wallet becomes the active one
+  watch.set(address.toLowerCase(), { acct: id, since });
+  return id;
 }
 
 /* ------------------------------------------------------------------ */
@@ -305,20 +305,25 @@ const field = (id, label, o = {}) => {
   const input = new TextInputBuilder()
     .setCustomId(id).setLabel(label)
     .setStyle(o.long ? TextInputStyle.Paragraph : TextInputStyle.Short)
-    .setRequired(true).setMinLength(o.min ?? 1).setMaxLength(o.max ?? 64);
+    .setRequired(!o.optional).setMinLength(o.optional ? 0 : (o.min ?? 1)).setMaxLength(o.max ?? 64);
   if (o.ph) input.setPlaceholder(o.ph);
+  if (o.value) input.setValue(o.value);
   return new ActionRowBuilder().addComponents(input);
 };
 const pinField = (id = 'pin', label = 'PIN (6–12 digits)') => field(id, label, { min: 6, max: 12, ph: 'digits only' });
-const modal = (id, title, ...rows) => new ModalBuilder().setCustomId(id).setTitle(title).addComponents(...rows);
+const labelField = () => field('label', 'Wallet name (optional)', { optional: true, max: 24, ph: 'e.g. Savings' });
+const modal = (id, title, ...rows) => new ModalBuilder().setCustomId(id).setTitle(title.slice(0, 45)).addComponents(...rows);
 
 const modals = {
-  create: () => modal('wallet:create', 'Create wallet', pinField(), pinField('pin2', 'Confirm PIN')),
+  create: () => modal('wallet:create', 'Create wallet', labelField(), pinField(), pinField('pin2', 'Confirm PIN')),
   import: () => modal('wallet:import', 'Import wallet',
-    field('secret', 'Private key or recovery phrase', { long: true, max: 300 }), pinField(), pinField('pin2', 'Confirm PIN')),
-  export: () => modal('wallet:export', 'Export private key', pinField()),
-  changepin: () => modal('wallet:changepin', 'Change PIN', pinField('old', 'Current PIN'), pinField('pin', 'New PIN (6–12 digits)'), pinField('pin2', 'Confirm new PIN')),
-  delete: () => modal('wallet:delete', 'Delete wallet', field('confirm', 'Type DELETE to confirm', { max: 6 }), pinField()),
+    field('secret', 'Private key or recovery phrase', { long: true, max: 300 }), labelField(), pinField(), pinField('pin2', 'Confirm PIN')),
+  export: (a) => modal(`wallet:export:${a.id}`, `Export key: ${a.label}`, pinField()),
+  changepin: (a) => modal(`wallet:changepin:${a.id}`, `Change PIN: ${a.label}`,
+    pinField('old', 'Current PIN'), pinField('pin', 'New PIN (6–12 digits)'), pinField('pin2', 'Confirm new PIN')),
+  delete: (a) => modal(`wallet:delete:${a.id}`, `Delete: ${a.label}`,
+    field('confirm', 'Type DELETE to confirm', { max: 6 }), pinField()),
+  rename: (a) => modal(`wallet:rename:${a.id}`, 'Rename wallet', field('label', 'New name', { max: 24, value: a.label })),
   send: () => modal('send:form', `Send ${SYMBOL}`,
     field('to', 'Recipient address', { min: 42, max: 42, ph: '0x…' }),
     field('amount', `Amount in ${SYMBOL} (or "max")`, { max: 30, ph: '0.05' })),
@@ -330,14 +335,15 @@ const modals = {
 const btn = (id, label, style = ButtonStyle.Secondary) => new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style);
 
 async function panelPayload(uid) {
-  const row = st.get.get(uid);
-  if (!row) {
+  const all = st.accounts.all(uid);
+  const active = all.length ? activeAccount(uid) : null;
+  if (!active) {
     const e = base(C.brand).setTitle('👛 Set up your wallet')
       .setDescription([
         'Hold, receive and send crypto without leaving Discord.',
         '',
         '**Create** a brand-new wallet, or **Import** one you already own.',
-        'Your key is encrypted with a PIN only you know.',
+        'Each wallet is encrypted with a PIN only you know.',
       ].join('\n'))
       .setThumbnail(botAvatar() || null);
     return { embeds: [e], components: [new ActionRowBuilder().addComponents(
@@ -345,26 +351,43 @@ async function panelPayload(uid) {
     )] };
   }
 
+  const u = st.user.get(uid);
   let bal = 'unavailable';
-  try { bal = `${fmt(await provider.getBalance(row.address))} ${SYMBOL}`; } catch { /* RPC hiccup */ }
-  const locked = row.locked_until > Date.now()
-    ? `\n🔒 PIN locked <t:${Math.ceil(row.locked_until / 1000)}:R>` : '';
-  const e = base(C.brand).setTitle('👛 Your wallet')
+  try { bal = `${fmt(await provider.getBalance(active.address))} ${SYMBOL}`; } catch { /* RPC hiccup */ }
+  const locked = u.locked_until > Date.now() ? `\n🔒 PIN locked <t:${Math.ceil(u.locked_until / 1000)}:R>` : '';
+  const link = addrLink(active.address);
+  const e = base(C.brand).setTitle(`👛 ${active.label}`)
     .setDescription(`### ${bal}${locked}`)
-    .addFields(
-      { name: 'Address', value: `\`${row.address}\`${addrLink(row.address)}` },
-      { name: 'Network', value: NETWORK_LABEL, inline: true },
-    )
+    .addFields({ name: 'Address', value: `\`${active.address}\`${link ? `\n${link}` : ''}` })
     .setThumbnail(botAvatar() || null)
     .setTimestamp();
-  return { embeds: [e], components: [
+  if (all.length > 1) {
+    e.addFields({
+      name: `Your wallets (${all.length}/${MAX_WALLETS})`,
+      value: all.map((a) => `${a.id === active.id ? '▶️' : '▫️'} **${a.label}** · \`${short(a.address)}\``).join('\n'),
+    });
+  }
+
+  const rows = [];
+  if (all.length > 1) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId('ui:switch').setPlaceholder('Switch wallet…').addOptions(
+        all.slice(0, 25).map((a) => ({ label: a.label, description: short(a.address), value: String(a.id), default: a.id === active.id })),
+      ),
+    ));
+  }
+  rows.push(
     new ActionRowBuilder().addComponents(
       btn('ui:deposit', '📥 Deposit', ButtonStyle.Success), btn('ui:send', '📤 Send', ButtonStyle.Primary), btn('ui:refresh', '🔄 Refresh'),
     ),
     new ActionRowBuilder().addComponents(
+      btn('ui:create', '✨ New wallet'), btn('ui:import', '📥 Import'), btn('ui:rename', '✏️ Rename'),
+    ),
+    new ActionRowBuilder().addComponents(
       btn('ui:export', '🔑 Export key'), btn('ui:changepin', '🔐 Change PIN'), btn('ui:delete', '🗑️ Delete', ButtonStyle.Danger),
     ),
-  ] };
+  );
+  return { embeds: [e], components: rows };
 }
 
 /* ------------------------------------------------------------------ */
@@ -395,7 +418,7 @@ async function buildQuote(row, toRaw, amountRaw) {
   const [balance, fd, code] = await Promise.all([
     provider.getBalance(row.address), provider.getFeeData(), provider.getCode(to),
   ]);
-  if (!isMax && value > balance) throw new UserError(`Insufficient balance: you have **${fmt(balance)} ${SYMBOL}**.`);
+  if (!isMax && value > balance) throw new UserError(`Insufficient balance in **${row.label}**: you have **${fmt(balance)} ${SYMBOL}**.`);
 
   const eip1559 = fd.maxFeePerGas != null && fd.maxPriorityFeePerGas != null;
   const feePerGas = eip1559 ? fd.maxFeePerGas : fd.gasPrice;
@@ -414,14 +437,17 @@ async function buildQuote(row, toRaw, amountRaw) {
     value = balance - fee;
     if (value <= 0n) throw new UserError(`Your balance (${fmt(balance)} ${SYMBOL}) doesn't cover the network fee (~${fmt(fee)}).`);
   } else if (value + fee > balance) {
-    throw new UserError(`Insufficient funds: need **${fmt(value + fee)} ${SYMBOL}** (amount + max fee), you have ${fmt(balance)}.`);
+    throw new UserError(`Insufficient funds: need **${fmt(value + fee)} ${SYMBOL}** (amount + max fee), **${row.label}** has ${fmt(balance)}.`);
   }
-  return { from: row.address, to, value, gasLimit, fee, balance, eip1559, feePerGas, tip: fd.maxPriorityFeePerGas, isContract: code !== '0x' };
+  return {
+    acct: row.id, label: row.label, from: row.address, to, value, gasLimit, fee, balance,
+    eip1559, feePerGas, tip: fd.maxPriorityFeePerGas, isContract: code !== '0x',
+  };
 }
 
 function quotePayload(q, quoteId) {
   const e = base(C.brand).setTitle('📤 Review & confirm')
-    .setDescription(`### ${ethers.formatEther(q.value)} ${SYMBOL}\n**${short(q.from)}** ➜ **${short(q.to)}**`)
+    .setDescription(`### ${ethers.formatEther(q.value)} ${SYMBOL}\n**${q.label}** (${short(q.from)}) ➜ **${short(q.to)}**`)
     .addFields(
       { name: 'Recipient', value: `\`${q.to}\`` },
       { name: 'Max network fee', value: `${fmt(q.fee)} ${SYMBOL}`, inline: true },
@@ -437,7 +463,7 @@ function quotePayload(q, quoteId) {
 }
 
 async function presentQuote(i, to, amount) {
-  const row = st.get.get(i.user.id);
+  const row = activeAccount(i.user.id);
   if (!row) return i.editReply(fail("You don't have a wallet yet. Use `/wallet panel`."));
   const q = await buildQuote(row, to, amount);
   const quoteId = crypto.randomBytes(8).toString('hex');
@@ -463,7 +489,7 @@ async function handleSendSubmit(i, quoteId) {
 
   sending.add(i.user.id);
   try {
-    const r = await unlock(i.user.id, pin);
+    const r = await unlock(i.user.id, pin, q.acct); // always the wallet the quote was made for
     if (r.status !== 'ok') return i.editReply(unlockFail(r));
     if (!pending.delete(quoteId)) return i.editReply(warn('Already used', 'This quote was already used.'));
 
@@ -481,7 +507,7 @@ async function handleSendSubmit(i, quoteId) {
       return i.editReply(fail(`Broadcast failed: ${rpcReason(e).slice(0, 200)}\nNothing was sent. You can press **Confirm** again.`));
     }
 
-    const line = `**${ethers.formatEther(q.value)} ${SYMBOL}** ➜ \`${short(q.to)}\``;
+    const line = `**${ethers.formatEther(q.value)} ${SYMBOL}** from **${q.label}** ➜ \`${short(q.to)}\``;
     await i.editReply({ embeds: [base(C.warn).setTitle('⏳ Transaction sent')
       .setDescription(`${line}\nTx: ${txLink(tx.hash)}\nWaiting for confirmation…`)], components: [] });
 
@@ -531,22 +557,25 @@ function checkPins(pin, pin2) {
 }
 
 async function handleModal(i) {
-  const id = i.customId;
+  const [ns, kind, arg] = i.customId.split(':');
   const uid = i.user.id;
   await i.deferReply(EPH);
 
-  if (id === 'send:form') {
-    return presentQuote(i, i.fields.getTextInputValue('to'), i.fields.getTextInputValue('amount'));
+  if (ns === 'send') {
+    if (kind === 'form') return presentQuote(i, i.fields.getTextInputValue('to'), i.fields.getTextInputValue('amount'));
+    if (kind === 'pin') return handleSendSubmit(i, arg);
+    return undefined;
   }
 
-  if (id === 'wallet:create' || id === 'wallet:import') {
+  if (kind === 'create' || kind === 'import') {
     const pin = i.fields.getTextInputValue('pin').trim();
     const err = checkPins(pin, i.fields.getTextInputValue('pin2').trim());
     if (err) return i.editReply(fail(err));
-    if (st.get.get(uid)) return i.editReply(warn('Wallet exists', 'You already have a wallet.'));
+    const count = st.count.get(uid).n;
+    if (count >= MAX_WALLETS) return i.editReply(warn('Wallet limit reached', `You can hold up to ${MAX_WALLETS} wallets. Delete one first.`));
 
+    const creating = kind === 'create';
     let w;
-    const creating = id === 'wallet:create';
     if (creating) {
       const r = ethers.Wallet.createRandom();
       w = { privateKey: r.privateKey, address: r.address };
@@ -554,70 +583,94 @@ async function handleModal(i) {
       w = parseSecret(i.fields.getTextInputValue('secret'));
       if (!w) return i.editReply(fail('Could not read that as a private key or recovery phrase.'));
     }
+    const label = cleanLabel(i.fields.getTextInputValue('label'), `Wallet ${count + 1}`);
+    let id;
     try {
-      await storeWallet(uid, w.privateKey, w.address, pin);
+      id = await storeWallet(uid, label, w.privateKey, w.address, pin);
     } catch (e) {
       if (/constraint/i.test(String(e.message))) return i.editReply(fail('That wallet is already registered with this bot.'));
       throw e;
     }
-    const p = await depositPayload(w.address, creating ? '🎉 Wallet created' : '🎉 Wallet imported');
+    const p = await depositPayload(st.account.get(id, uid), creating ? `🎉 Wallet created • ${label}` : `🎉 Wallet imported • ${label}`);
     p.embeds[0].addFields({
       name: 'Important',
-      value: 'Back up your key with **Export key** in `/wallet panel`. If you forget your PIN, your funds are unrecoverable.',
+      value: `It's now your **active** wallet. Back up its key with **Export key** in \`/wallet panel\`. If you forget this wallet's PIN, its funds are unrecoverable.`,
     });
     return i.editReply(p);
   }
 
-  if (id === 'wallet:export') {
-    const r = await unlock(uid, i.fields.getTextInputValue('pin').trim());
+  const row = st.account.get(Number(arg), uid);
+  if (!row) return i.editReply(fail('That wallet no longer exists.'));
+
+  if (kind === 'export') {
+    const r = await unlock(uid, i.fields.getTextInputValue('pin').trim(), row.id);
     if (r.status !== 'ok') return i.editReply(unlockFail(r));
-    return i.editReply({ embeds: [base(C.warn).setTitle('🔑 Your private key')
+    return i.editReply({ embeds: [base(C.warn).setTitle(`🔑 Private key • ${row.label}`)
       .setDescription(`Never share this. Anyone with it controls your funds.\n||\`${r.privateKey}\`||`)] });
   }
 
-  if (id === 'wallet:changepin') {
+  if (kind === 'rename') {
+    const label = cleanLabel(i.fields.getTextInputValue('label'), row.label);
+    st.rename.run(label, row.id, uid);
+    return i.editReply(ok('Renamed', `**${row.label}** is now **${label}**.`));
+  }
+
+  if (kind === 'changepin') {
     const nu = i.fields.getTextInputValue('pin').trim();
     const err = checkPins(nu, i.fields.getTextInputValue('pin2').trim());
     if (err) return i.editReply(fail(err));
-    const r = await unlock(uid, i.fields.getTextInputValue('old').trim());
+    const r = await unlock(uid, i.fields.getTextInputValue('old').trim(), row.id);
     if (r.status !== 'ok') return i.editReply(unlockFail(r));
-    const enc = await encryptKey(uid, r.row.address, r.privateKey, nu);
-    st.reencrypt.run({ discord_id: uid, ...enc });
-    return i.editReply(ok('PIN changed', 'Use your new PIN from now on.'));
+    const enc = await encryptKey(uid, row.address, r.privateKey, nu);
+    st.reencrypt.run({ id: row.id, ...enc });
+    return i.editReply(ok('PIN changed', `Use the new PIN for **${row.label}** from now on.`));
   }
 
-  if (id === 'wallet:delete') {
+  if (kind === 'delete') {
     if (i.fields.getTextInputValue('confirm').trim() !== 'DELETE') return i.editReply(warn('Cancelled', 'You must type `DELETE` exactly.'));
-    const r = await unlock(uid, i.fields.getTextInputValue('pin').trim());
+    const r = await unlock(uid, i.fields.getTextInputValue('pin').trim(), row.id);
     if (r.status !== 'ok') return i.editReply(unlockFail(r));
-    st.del.run(uid);
-    watch.delete(r.row.address.toLowerCase());
-    return i.editReply(ok('Wallet deleted', 'Removed from this bot. Funds on the address are only recoverable if you exported the key.'));
+    st.del.run(row.id, uid);
+    watch.delete(row.address.toLowerCase());
+    activeAccount(uid); // re-points the active wallet if needed
+    return i.editReply(ok('Wallet deleted', `**${row.label}** was removed from this bot. Funds on \`${short(row.address)}\` are only recoverable if you exported the key.`));
   }
-
-  if (id.startsWith('send:pin:')) return handleSendSubmit(i, id.slice('send:pin:'.length));
+  return undefined;
 }
 
 /* ------------------------------------------------------------------ */
-/* Commands, buttons                                                   */
+/* Commands, buttons, menus                                            */
 /* ------------------------------------------------------------------ */
 const commands = [
-  new SlashCommandBuilder().setName('wallet').setDescription('Your crypto wallet')
+  new SlashCommandBuilder().setName('wallet').setDescription('Your crypto wallets')
     .addSubcommand((s) => s.setName('panel').setDescription('Open your wallet dashboard'))
     .addSubcommand((s) => s.setName('create').setDescription('Create a new wallet'))
     .addSubcommand((s) => s.setName('import').setDescription('Import a private key or recovery phrase'))
-    .addSubcommand((s) => s.setName('deposit').setDescription('Show your address and QR code'))
-    .addSubcommand((s) => s.setName('balance').setDescription('Show your balance'))
-    .addSubcommand((s) => s.setName('export').setDescription('Reveal your private key (PIN required)'))
-    .addSubcommand((s) => s.setName('changepin').setDescription('Change your PIN'))
-    .addSubcommand((s) => s.setName('delete').setDescription('Delete your wallet from this bot')),
-  new SlashCommandBuilder().setName('send').setDescription(`Send ${SYMBOL} from your wallet`)
+    .addSubcommand((s) => s.setName('switch').setDescription('Switch your active wallet')
+      .addStringOption((o) => o.setName('wallet').setDescription('Which wallet').setRequired(true).setAutocomplete(true)))
+    .addSubcommand((s) => s.setName('rename').setDescription('Rename your active wallet'))
+    .addSubcommand((s) => s.setName('deposit').setDescription('Show your active address and QR code'))
+    .addSubcommand((s) => s.setName('balance').setDescription('Show your active wallet balance'))
+    .addSubcommand((s) => s.setName('export').setDescription('Reveal the active wallet private key (PIN required)'))
+    .addSubcommand((s) => s.setName('changepin').setDescription('Change the active wallet PIN'))
+    .addSubcommand((s) => s.setName('delete').setDescription('Delete the active wallet from this bot')),
+  new SlashCommandBuilder().setName('send').setDescription(`Send ${SYMBOL} from your active wallet`)
     .addStringOption((o) => o.setName('to').setDescription('Recipient 0x address').setRequired(true))
     .addStringOption((o) => o.setName('amount').setDescription(`Amount in ${SYMBOL}, or "max"`).setRequired(true)),
 ].map((c) => c.toJSON());
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+// Keep discord.js caches tiny: this bot only needs interactions + DMs.
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds],
+  makeCache: Options.cacheWithLimits({
+    ...Options.DefaultMakeCacheSettings,
+    MessageManager: 0, PresenceManager: 0, ReactionManager: 0, GuildMemberManager: 0, GuildBanManager: 0,
+    GuildInviteManager: 0, GuildScheduledEventManager: 0, GuildStickerManager: 0, GuildEmojiManager: 0,
+    StageInstanceManager: 0, VoiceStateManager: 0, ThreadMemberManager: 0, UserManager: 25,
+  }),
+});
 const noWallet = () => ({ ...fail("You don't have a wallet yet. Use `/wallet panel` to set one up."), ...EPH });
+const atLimit = () => ({ ...warn('Wallet limit reached', `You can hold up to ${MAX_WALLETS} wallets. Delete one first.`), ...EPH });
 
 async function handleCommand(i) {
   const uid = i.user.id;
@@ -628,25 +681,30 @@ async function handleCommand(i) {
   }
 
   const sub = i.options.getSubcommand();
-  const row = st.get.get(uid);
 
-  if (sub === 'panel') {
+  if (sub === 'panel') { await i.deferReply(EPH); return i.editReply(await panelPayload(uid)); }
+  if (sub === 'create' || sub === 'import') {
+    if (st.count.get(uid).n >= MAX_WALLETS) return i.reply(atLimit());
+    return i.showModal(modals[sub]());
+  }
+
+  const row = activeAccount(uid);
+  if (!row) return i.reply(noWallet());
+
+  if (sub === 'switch') {
+    const target = st.account.get(Number(i.options.getString('wallet', true)), uid);
+    if (!target) return i.reply({ ...fail('Pick a wallet from the list.'), ...EPH });
+    st.setActive.run(target.id, uid);
     await i.deferReply(EPH);
     return i.editReply(await panelPayload(uid));
   }
-  if (sub === 'create' || sub === 'import') {
-    if (row) return i.reply({ ...warn('Wallet exists', 'You already have a wallet. Delete it first to start over.'), ...EPH });
-    return i.showModal(modals[sub]());
-  }
-  if (!row) return i.reply(noWallet());
-
-  if (sub === 'deposit') { await i.deferReply(EPH); return i.editReply(await depositPayload(row.address)); }
+  if (sub === 'deposit') { await i.deferReply(EPH); return i.editReply(await depositPayload(row)); }
   if (sub === 'balance') {
     await i.deferReply(EPH);
-    return i.editReply({ embeds: [base(C.brand).setTitle('💰 Balance')
+    return i.editReply({ embeds: [base(C.brand).setTitle(`💰 ${row.label}`)
       .setDescription(`### ${fmt(await provider.getBalance(row.address))} ${SYMBOL}\n\`${row.address}\``)] });
   }
-  return i.showModal(modals[sub]()); // export | changepin | delete
+  return i.showModal(modals[sub](row)); // rename | export | changepin | delete
 }
 
 async function handleButton(i) {
@@ -662,29 +720,52 @@ async function handleButton(i) {
       pending.delete(arg);
       return i.update({ embeds: [base(C.warn).setTitle('Cancelled').setDescription('Nothing was sent.')], components: [] });
     }
-    return i.showModal(modal(`send:pin:${arg}`, 'Confirm transaction', pinField()));
+    return i.showModal(modal(`send:pin:${arg}`, `Confirm from ${q.label}`, pinField()));
   }
 
   if (ns === 'ui') {
-    const row = st.get.get(i.user.id);
+    const uid = i.user.id;
     if (action === 'create' || action === 'import') {
-      if (row) return i.reply({ ...warn('Wallet exists', 'You already have a wallet.'), ...EPH });
+      if (st.count.get(uid).n >= MAX_WALLETS) return i.reply(atLimit());
       return i.showModal(modals[action]());
     }
+    const row = activeAccount(uid);
     if (!row) return i.reply(noWallet());
-    if (action === 'refresh') { await i.deferUpdate(); return i.editReply(await panelPayload(i.user.id)); }
-    if (action === 'deposit') { await i.deferReply(EPH); return i.editReply(await depositPayload(row.address)); }
-    return i.showModal(modals[action]()); // send | export | changepin | delete
+    if (action === 'refresh') { await i.deferUpdate(); return i.editReply(await panelPayload(uid)); }
+    if (action === 'deposit') { await i.deferReply(EPH); return i.editReply(await depositPayload(row)); }
+    return i.showModal(modals[action](row)); // send | rename | export | changepin | delete
   }
+  return undefined;
+}
+
+async function handleSelect(i) {
+  if (i.customId !== 'ui:switch') return;
+  const target = st.account.get(Number(i.values[0]), i.user.id);
+  if (!target) return i.reply({ ...fail('That wallet no longer exists.'), ...EPH });
+  st.setActive.run(target.id, i.user.id);
+  await i.deferUpdate();
+  await i.editReply(await panelPayload(i.user.id));
+}
+
+async function handleAutocomplete(i) {
+  const q = i.options.getFocused().toLowerCase();
+  const list = st.accounts.all(i.user.id)
+    .filter((a) => a.label.toLowerCase().includes(q) || a.address.toLowerCase().includes(q))
+    .slice(0, 25)
+    .map((a) => ({ name: `${a.label} (${short(a.address)})`.slice(0, 100), value: String(a.id) }));
+  await i.respond(list);
 }
 
 client.on(Events.InteractionCreate, async (i) => {
   try {
-    if (i.isChatInputCommand()) await handleCommand(i);
+    if (i.isAutocomplete()) await handleAutocomplete(i);
+    else if (i.isChatInputCommand()) await handleCommand(i);
     else if (i.isButton()) await handleButton(i);
+    else if (i.isStringSelectMenu()) await handleSelect(i);
     else if (i.isModalSubmit()) await handleModal(i);
   } catch (e) {
     if (!(e instanceof UserError)) console.error(e);
+    if (i.isAutocomplete()) return;
     const payload = fail(e instanceof UserError ? e.message : 'Something went wrong. Please try again.');
     try {
       if (i.deferred || i.replied) await i.editReply(payload);
@@ -696,29 +777,41 @@ client.on(Events.InteractionCreate, async (i) => {
 /* ------------------------------------------------------------------ */
 /* Deposit watcher                                                     */
 /* ------------------------------------------------------------------ */
-async function notifyDeposit(userId, address, tx, block) {
+async function notifyDeposit(acctId, tx, block) {
+  const a = st.byId.get(acctId);
+  if (!a) return;
   const e = base(C.ok).setTitle('💸 Deposit received')
     .setDescription(`### +${ethers.formatEther(tx.value)} ${SYMBOL}`)
     .addFields(
+      { name: 'Wallet', value: `**${a.label}** · \`${short(a.address)}\``, inline: true },
       { name: 'From', value: `\`${short(tx.from)}\``, inline: true },
       { name: 'Block', value: String(block), inline: true },
       { name: 'Tx', value: txLink(tx.hash) },
     ).setThumbnail(botAvatar() || null).setTimestamp();
   try {
-    const bal = await provider.getBalance(address);
-    e.addFields({ name: 'New balance', value: `${fmt(bal)} ${SYMBOL}` });
+    e.addFields({ name: 'New balance', value: `${fmt(await provider.getBalance(a.address))} ${SYMBOL}` });
   } catch { /* optional */ }
   try {
-    const user = await client.users.fetch(userId);
+    const user = await client.users.fetch(a.discord_id);
     await user.send({ embeds: [e] });
   } catch (err) {
-    console.warn(`Could not DM ${userId} (DMs closed?): ${err.message}`);
+    console.warn(`Could not DM ${a.discord_id} (they must share a server with the bot, and allow DMs): ${err.message}`);
   }
 }
 
 async function pollDeposits() {
   try {
     const target = (await provider.getBlockNumber()) - CONFIRMATIONS;
+    if (watch.size === 0) {
+      // nobody to watch for: skip ahead instead of downloading blocks
+      if (target > lastScanned) { lastScanned = target; st.setMeta.run('last_scanned', String(target)); }
+      return;
+    }
+    if (target - lastScanned > MAX_CATCHUP_BLOCKS) {
+      console.warn(`Watcher was ${target - lastScanned} blocks behind; skipping to the last ${MAX_CATCHUP_BLOCKS} (older deposits won't trigger DMs).`);
+      lastScanned = target - MAX_CATCHUP_BLOCKS;
+      st.setMeta.run('last_scanned', String(lastScanned));
+    }
     let done = 0;
     for (let n = lastScanned + 1; n <= target && done < MAX_BLOCKS_PER_TICK; n++, done++) {
       const block = await provider.getBlock(n, true);
@@ -727,7 +820,8 @@ async function pollDeposits() {
         if (!tx.to || tx.value === 0n) continue;
         const w = watch.get(tx.to.toLowerCase());
         if (!w || n <= w.since || tx.from.toLowerCase() === tx.to.toLowerCase()) continue;
-        if (st.deposit.run(tx.hash, w.id, tx.value.toString(), n).changes) notifyDeposit(w.id, tx.to, tx, n);
+        const a = st.byId.get(w.acct);
+        if (a && st.deposit.run(tx.hash, a.discord_id, tx.value.toString(), n).changes) notifyDeposit(w.acct, tx, n);
       }
       lastScanned = n;
       st.setMeta.run('last_scanned', String(n));
@@ -742,6 +836,9 @@ async function pollDeposits() {
 /* ------------------------------------------------------------------ */
 /* Boot                                                                */
 /* ------------------------------------------------------------------ */
+console.log(`Starting… ${mem()}`);
+setInterval(() => console.log(`[mem] ${mem()}`), 10 * 60 * 1000).unref();
+
 (async () => {
   provider = await connect();
   const saved = st.getMeta.get('last_scanned');
@@ -754,7 +851,7 @@ async function pollDeposits() {
   );
 
   client.once(Events.ClientReady, (c) => {
-    console.log(`Logged in as ${c.user.tag}`);
+    console.log(`Logged in as ${c.user.tag} • ${mem()}`);
     pollDeposits();
   });
   await client.login(TOKEN);
